@@ -1,5 +1,33 @@
 # Wayland 适配研究 / Wayland Adaptation Research
 
+> ## ⚠️ 先读这个：本分支**尚未完成**的事项
+>
+> **1. 本地真实 Wayland 会话未测试。** 执行本项工作时本机没有原生 Wayland 会话（无 Wayland socket、未安装任何 Wayland 合成器、`XDG_SESSION_TYPE` 未设置）。按测试隔离原则**未执行本地测试**，也**未改动宿主 X11 环境的任何配置**。当前状态是「沙盒已验证，本地暂缺环境」。
+>
+> **2. 层壳协议（降级策略第 1 层）从未实际运行过。** 沙盒合成器不提供该协议，本机也没有 wlroots 系合成器。该路径目前**只有能力探测代码，没有实机数据**。
+>
+> **3. 未在真实桌面合成器（GNOME / KDE）上运行过。** 第 2 层中关于 X11 兼容层的窗口定位与置顶属性是否可用，是**按惯例推断，未经实机确认**。
+>
+> **4. Wayland 后端尚未接入宿主启动路径。** 宿主目前**仍然只走 X11**；本目录不参与进程启动。README 里的性能与内存数字均为 X11 路径的实测值。
+>
+> **5. 协议原型为单缓冲**，未处理缓冲释放事件；正式实现需要双缓冲。**多显示器与分数缩放未测。**
+>
+> 完整清单见 §6；目录级说明见 [`../wayland/README.md`](../wayland/README.md)。
+>
+> ## ⚠️ Read this first: what this branch has **NOT** done
+>
+> **1. No local real-Wayland-session test.** The host had no native Wayland session (no Wayland socket, no compositor installed, `XDG_SESSION_TYPE` unset). Per the test-isolation policy **no local test was performed and no part of the host's X11 configuration was altered to enable one.** Status: sandbox-verified, no local session available.
+>
+> **2. The layer-shell protocol (Tier 1) has never been executed.** The sandbox compositor does not provide it and no wlroots-family compositor is present. That path currently has **capability-probing code only, with no hardware data**.
+>
+> **3. Never run under a real desktop compositor (GNOME / KDE).** Availability of window positioning and always-on-top in Tier 2's X11 compatibility layer is **inferred from convention, not confirmed on hardware**.
+>
+> **4. The Wayland backend is not wired into the host's startup path.** The host **still runs on X11 only**; this directory takes no part in process startup. Every performance and memory figure in the README is an X11-path measurement.
+>
+> **5. The protocol prototype is single-buffered** and does not handle buffer-release events; a production implementation requires double buffering. **Multi-monitor and fractional scaling are untested.**
+>
+> Full list in §6; directory-level notes in [`../wayland/README.md`](../wayland/README.md).
+
 **中**　本文件记录本项目在 Wayland 合成器下运行所需的协议层实现、实测数据、生态现状与降级策略。
 **EN**　This document records the protocol-layer implementation, measured data, ecosystem status and degradation strategy required to run this project under a Wayland compositor.
 

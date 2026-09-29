@@ -1,5 +1,21 @@
 # wayland/ — Wayland 协议层适配与测试床 / Wayland Protocol Adaptation and Testbed
 
+> ## ⚠️ 本目录**尚未完成**的事项（先读）
+>
+> - **本地真实 Wayland 会话未测试** —— 本机没有该环境，按隔离原则未强行运行。
+> - **层壳协议（降级第 1 层）从未实际运行** —— 没有 wlroots 系合成器可用。
+> - **未在真实桌面合成器（GNOME / KDE）上运行过。**
+> - **未接入宿主启动路径** —— 宿主仍然只走 X11，本目录只在手动执行时运行。
+> - **单缓冲、未接缓冲释放事件**；多显示器与分数缩放未测。
+>
+> ## ⚠️ What this directory has **NOT** done (read first)
+>
+> - **No local real-Wayland-session test** — the host has no such environment; not forced, per the isolation policy.
+> - **The layer-shell protocol (Tier 1) has never been executed** — no wlroots-family compositor available.
+> - **Never run under a real desktop compositor (GNOME / KDE).**
+> - **Not wired into the host's startup path** — the host still runs X11 only; this directory runs only when invoked manually.
+> - **Single-buffered, no buffer-release handling**; multi-monitor and fractional scaling untested.
+
 **中**　本目录是《[Wayland 适配研究](../docs/Wayland-Adaptation-Research.md)》的可复现代码。它**不参与宿主进程的启动** —— 宿主目前仍走 X11；这里存放的是评估 Wayland 后端时用到的一切。
 
 **EN**　This directory holds the reproducible code behind [Wayland Adaptation Research](../docs/Wayland-Adaptation-Research.md). It is **not part of the host's startup path** — the host still runs on X11; what lives here is everything used while evaluating a Wayland backend.

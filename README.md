@@ -52,6 +52,16 @@ instead of Electron/Chromium. The upstream Node core is reused as-is.
 
 ## 平台支持：X11 与 Wayland / Platform Support
 
+> ### ⚠️ Wayland 侧**尚未完成**的事项（先读）
+>
+> - **本地真实 Wayland 会话未测试** —— 本机没有该环境（无 Wayland socket、未安装任何合成器），按隔离原则未强行运行。
+> - **层壳协议（降级第 1 层）从未实际运行** —— 没有 wlroots 系合成器可用。
+> - **未在真实桌面合成器（GNOME / KDE）上运行过。**
+> - **未接入宿主启动路径** —— 宿主**仍然只走 X11**；本文档中所有性能与内存数字都是 X11 路径的实测值。
+> - 协议原型为单缓冲；多显示器与分数缩放未测。
+>
+> 完整清单见 [`docs/Wayland-Adaptation-Research.md` §6](docs/Wayland-Adaptation-Research.md#6-未验证事项--unverified-items)。
+
 **当前状态：X11 已实机运行；Wayland 已完成协议层实现与沙盒实测，但本机暂无本地 Wayland 会话，尚未接入宿主启动路径。**
 
 本项目原先只针对 X11。Wayland 方向的代码在 [`wayland/`](wayland/)，完整记录见 [`docs/Wayland-Adaptation-Research.md`](docs/Wayland-Adaptation-Research.md)。
