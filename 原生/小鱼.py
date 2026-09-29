@@ -77,6 +77,13 @@ class 弹簧:
 }
 # 身体倾斜分配给整个人物组还是留给脖子（figure.js 的 GROUP）
 组倾 = {"air": (1, 1), "drag": (1, 1), "crouch": (1, 1), "land": (1, 1), "walk": (1, .5), "run": (1, .5)}
+# v0.1.7：眉毛随表情，单位是母图像素 —— (整体抬起, 内端抬起)，内端为负就是皱眉
+眉表 = {
+    "surprised": (6, 0), "angry": (-1, -5), "sad": (1, 5), "shy": (1, 2.5), "happy": (2, 0),
+    "love": (2, 0), "wink": (1, 0), "sleepy": (-1.5, 0), "sleep": (-1.5, 0), "dizzy": (1, 3),
+    "dragged": (2, 3.5), "thinking": (0, 2), "waking": (2, 1), "listening": (1, 0),
+    "content": (-1, 0), "squeeze": (-1, -2), "run": (1, 0),
+}
 
 
 class 小鱼:
@@ -92,6 +99,8 @@ class 小鱼:
         self.配色名 = 模型.配色
         项 = next((s for s in 模型.配色表 if s["id"] == 模型.配色), {})
         self.强调色 = QColor(项.get("accent") or "#4d6bfe")
+        # v0.1.7：两侧眉毛的分界（近眉在左、远眉在右），母图像素 → 绑骨单位
+        self.眉分界 = 模型.U(765)
         self.弹簧 = {
             "hair": 弹簧(55, 7, 1.8), "hairY": 弹簧(50, 8, 1.2), "bangs": 弹簧(110, 10, 1.6),
             "skirt": 弹簧(100, 9, 1.6), "skirtY": 弹簧(90, 10, 1.1), "tail": 弹簧(40, 5, 32),
@@ -113,6 +122,11 @@ class 小鱼:
         self.尾情绪 = 0.0
         self.摆幅 = 0.0
         self.坐k = 0.0
+        # v0.1.7：眉毛与眼皮褶线的状态
+        self.眉抬 = 0.0
+        self.眉内 = 0.0
+        self.褶落 = [0.0, 0.0]
+        self.褶透明 = 1.0
 
     def 组倾角(self, 模式: str, 倾: float, 靠: float) -> float:
         """身体本来想给整个人物组的倾斜；组没拿走的那部分，figure 会还给脖子。"""
@@ -224,8 +238,11 @@ class 小鱼:
         st["skirt"] = {"fn": 裙摆}
         st["skirtSit"] = {"fn": lambda u, v, x=0, y=0: [sk * 1.5 * v * v, -max(0.0, 呼吸) * .4 * v]}
         st["alpha"]["skirt"] = 1 - 坐进
+        # v0.1.7：后腰蝴蝶结拆成了「站姿层 / 坐姿层」，透明度跟裙摆一个逻辑
+        st["alpha"]["waist_bow_front"] = 1 - 坐进
         st["alpha"]["leg_back"] = st["alpha"]["leg_front"] = 1 - _顺(.42, .52, self.坐k)
         st["alpha"]["skirt_sit"] = 坐进
+        st["alpha"]["waist_bow_sit_front"] = 坐进
         st["armNear"] = {"a": armN}
         st["armFar"] = {"a": armF}
         st["legBack"] = {"a": _插(腿角[0], -55, self.坐k), "ty": -抬[0] * .9 * (1 - self.坐k)}
@@ -241,6 +258,49 @@ class 小鱼:
 
         st["headFront"] = {"fn": 视差(4.2, 2.8)}
         st["headFeat"] = {"fn": 视差(2, 1.4)}
+        # ── v0.1.7：眉毛与眼皮褶线 ──
+        # 眉毛：整条抬起 browLift + 靠鼻子的内端额外抬起 browInner（内端为负就是皱眉），
+        # 用 k² 让抬起来的效果集中在内端；眨眼时整条跟着下沉一点。
+        if self.模型.有眉:
+            抬, 内 = 眉表.get(名, (0, 0))
+            self.眉抬 = _插(self.眉抬, 抬 - 1.5 * (帧.get("blink", 0) or 0), _缓(14, dt))
+            self.眉内 = _插(self.眉内, 内, _缓(10, dt))
+            bx0 = self.模型.矩形("brows")[0]
+            bx1 = self.模型.矩形("brows")[2]
+            分 = self.眉分界
+            _抬, _内, _S = self.眉抬, self.眉内, self.模型.S
+
+            def 眉动(u, v, x=0, y=0, _bx0=bx0, _bx1=bx1, _分=分, _抬=_抬, _内=_内, _S=_S):
+                # 外端 0 → 内端 1
+                k = _夹((x - _bx0) / (_分 - _bx0), 0, 1) if x < _分 else _夹((_bx1 - x) / (_bx1 - _分), 0, 1)
+                return [0, -(_抬 + _内 * k * k) * _S]
+
+            st["brows"] = {"fn": 眉动}
+        # 眼皮褶线：跟着上眼皮一起下移；眼睛不是"睁眼型"（眯眼/闭眼）时整条淡出
+        if self.模型.有褶:
+            眼们 = 脸.get("eyes") or [{}, {}]
+            有倾 = bool(脸.get("brows"))
+
+            def 眼皮落(e, k):
+                sh = e.get("shape")
+                if sh == "ring":
+                    开 = _夹((e.get("ry", 16) or 16) / (e.get("rx", 16) or 16), 0, 1) * (.8 if 有倾 else 1)
+                elif sh == "lid":
+                    开 = _夹((e.get("ry", 16) or 0) / 16, 0, 1)
+                else:
+                    开 = 1.0
+                return self.脸画师.眼[k]["travel"] * (1 - 开) * .75
+
+            for i, k in enumerate(("eyeL", "eyeR")):
+                e = 眼们[i] if i < len(眼们) else {}
+                self.褶落[i] = _插(self.褶落[i], 眼皮落(e, k), _缓(12, dt))
+            开们 = (1 if (眼们[0] if len(眼们) > 0 else {}).get("shape") in ("ring", "lid") else 0) + \
+                   (1 if (眼们[1] if len(眼们) > 1 else {}).get("shape") in ("ring", "lid") else 0)
+            self.褶透明 = _插(self.褶透明, 开们 / 2, _缓(12, dt))
+            st["alpha"]["eye_creases"] = self.褶透明
+            _落0, _落1, _分2, _S2 = self.褶落[0], self.褶落[1], self.眉分界, self.模型.S
+            st["creases"] = {"fn": lambda u, v, x=0, y=0, a=_落0, b=_落1, f=_分2, s=_S2:
+                             [0, (a if x < f else b) * s]}
         st["headMid"] = {"fn": 视差(2, 1.4)}
         st["headBack"] = {"fn": 视差(-1.4, -1)}
         # 长发挂在头上，但下半截跟着身体

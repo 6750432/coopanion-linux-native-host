@@ -28,7 +28,7 @@ from 网格 import 网格渲染器                  # noqa: E402
 from 身体 import 身体                        # noqa: E402
 from 合成 import 合成器                      # noqa: E402
 
-网页 = Path.home() / "coop-linux/app/packages/cortico-world-desktop-pet/web"
+网页 = _资源 if (_资源 := __import__("os").environ.get("COOP_ASSETS")) else Path.home() / "coop-linux/app/packages/cortico-world-desktop-pet/web"
 宽, 高 = 1920, 1080
 
 

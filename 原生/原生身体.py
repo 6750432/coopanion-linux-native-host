@@ -128,7 +128,7 @@ class 原生桌宠:
         self.模型 = 鲸鱼模型(网页目录)
         self.网格 = 网格渲染器(self.模型, max(.2, 缩放 * 1.25), 格步)
         self.鱼 = 小鱼(self.模型, self.网格)
-        self.屏幕 = QGuiApplication.primaryScreen().availableGeometry()
+        self.屏幕 = 取屏幕()
         self.身体 = 身体(锚点=self.鱼.锚点,
                          边界=lambda: (self.屏幕.width(), self.屏幕.height(),
                                        self.屏幕.height() - 2, 缩放),
@@ -371,6 +371,40 @@ class 原生桌宠:
     def 报(self):
         if self.帧数:
             记(f"跑了 {self.帧数} 帧，平均每帧 {self.累计ms / self.帧数:.1f} ms（{帧率} fps 上限）")
+
+
+def 取屏幕() -> QRect:
+    """拿到可用的桌面矩形，**必须带兜底**。
+
+    English: Qt's `availableGeometry()` can come back empty (0x0) on some X
+    setups — remote/odd sessions, or when the platform plugin cannot query
+    RandR. Without a fallback the pet window lands at (0,0) and the roaming
+    boundary degenerates to nothing, so she never paints. Fall back to
+    `geometry()`, then to `COOP_SCREEN=WxH`, then to 1920x1080.
+
+    中文：`availableGeometry()` 在某些 X 环境里会返回 0×0（远程会话，或平台插件
+    查不到 RandR 时）。**不兜底的话窗口会落在 (0,0)、活动边界退化成 0×0，她就
+    一个像素都画不出来**。兜底顺序：availableGeometry → geometry →
+    环境变量 `COOP_SCREEN=宽x高` → 1920×1080。
+    """
+    屏 = QGuiApplication.primaryScreen()
+    方 = 屏.availableGeometry() if 屏 else QRect()
+    if 方.width() > 0 and 方.height() > 0:
+        return 方
+    if 屏 is not None and 屏.geometry().width() > 0:
+        记(f"⚠ availableGeometry 是空的，退回 geometry：{屏.geometry()}")
+        return 屏.geometry()
+    手 = os.environ.get("COOP_SCREEN", "")
+    if "x" in 手:
+        try:
+            宽, 高 = (int(v) for v in 手.lower().split("x", 1))
+            if 宽 > 0 and 高 > 0:
+                记(f"⚠ Qt 读不到屏幕，用 COOP_SCREEN={宽}x{高}")
+                return QRect(0, 0, 宽, 高)
+        except ValueError:
+            pass
+    记("⚠ Qt 读不到屏幕尺寸，兜底用 1920x1080（可用 COOP_SCREEN=宽x高 覆盖）")
+    return QRect(0, 0, 1920, 1080)
 
 
 class 桌宠窗口(QWidget):

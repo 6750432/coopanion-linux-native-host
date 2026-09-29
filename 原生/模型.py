@@ -50,6 +50,20 @@ class 鲸鱼模型:
             "id": "faceFx", "tex": "faceFx", "z": 9, "parent": "headFeat", "grid": [4, 4],
             "box": [self.U(FACE["x"]), self.V(FACE["y"]), FACE["w"] * self.S, FACE["h"] * self.S],
         })
+        # v0.1.7：眉毛贴在刘海下面的皮肤上，并且**透过刘海再淡淡画一次**
+        # （同一张贴图叠在刘海上，alpha .4）。两侧眉毛靠一个 warp 变形器分别抬起／倾斜。
+        self.有眉 = False
+        眉 = next((p for p in self.部件 if p["id"] == "brows"), None)
+        if 眉 is not None:
+            self.有眉 = True
+            眉["parent"] = "brows"
+            self.部件.append({**眉, "id": "brows_through", "z": 13.2, "alpha": .4})
+        # v0.1.7：双眼皮褶线跟着上眼皮一起下移，眼睛完全闭上时淡出
+        self.有褶 = False
+        褶 = next((p for p in self.部件 if p["id"] == "eye_creases"), None)
+        if 褶 is not None:
+            self.有褶 = True
+            褶["parent"] = "creases"
         self.盒 = {p["id"]: p["box"] for p in self.部件}
 
         # 变形器表（照 figure.js 的 deformers 抄）
@@ -75,6 +89,11 @@ class 鲸鱼模型:
             "finFar":   {"kind": "rot",  "parent": "headBack", "pivot": PV["finFar"]},
             "ahoge":    {"kind": "rot",  "parent": "headFront", "pivot": PV["ahoge"]},
         }
+        # v0.1.7 新增的两个变形器：眉毛与眼皮褶线，都挂在 headFeat 下面跟随头部视差
+        if self.有眉:
+            self.变形器["brows"] = {"kind": "warp", "parent": "headFeat", "rect": R("brows")}
+        if self.有褶:
+            self.变形器["creases"] = {"kind": "warp", "parent": "headFeat", "rect": R("eye_creases")}
         self._贴图: dict[str, QImage] = {}
         self.读贴图()
 

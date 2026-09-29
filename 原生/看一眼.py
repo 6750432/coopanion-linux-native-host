@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -17,7 +18,8 @@ from 模型 import 鲸鱼模型                                      # noqa: E40
 from 小鱼 import 小鱼 as 鱼类                                          # noqa: E402
 from 网格 import 网格渲染器                                    # noqa: E402
 
-网页 = Path.home() / "coop-linux/app/packages/cortico-world-desktop-pet/web"
+_资源 = os.environ.get("COOP_ASSETS")
+网页 = Path(_资源) if _资源 else (Path.home() / "coop-linux/app/packages/cortico-world-desktop-pet/web")
 宽, 高 = 1920, 1080
 
 

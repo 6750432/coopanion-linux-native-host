@@ -28,7 +28,7 @@ from PySide6.QtGui import (QColor, QGuiApplication, QImage, QPainter,   # noqa: 
 from 模型 import 鲸鱼模型                                          # noqa: E402
 from 网格 import 网格渲染器                                        # noqa: E402
 
-网页 = Path.home() / "coop-linux/app/packages/cortico-world-desktop-pet/web"
+网页 = _资源 if (_资源 := __import__("os").environ.get("COOP_ASSETS")) else Path.home() / "coop-linux/app/packages/cortico-world-desktop-pet/web"
 画布边长 = 217          # 和实际用的画布一样（缩放 0.62 × 1.25）
 
 

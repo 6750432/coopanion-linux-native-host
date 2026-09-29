@@ -27,7 +27,7 @@ from 模型 import 鲸鱼模型                                              # n
 from 小鱼 import 小鱼                                                  # noqa: E402
 from 网格 import 网格渲染器                                            # noqa: E402
 
-网页 = Path.home() / "coop-linux/app/packages/cortico-world-desktop-pet/web"
+网页 = _资源 if (_资源 := __import__("os").environ.get("COOP_ASSETS")) else Path.home() / "coop-linux/app/packages/cortico-world-desktop-pet/web"
 比例 = 0.62 * 1.25
 帧样本 = {"t": 1.0, "face": "neutral", "mode": "idle", "look": [2, 1], "swing": 8,
           "legs": [[104, 212, 104, 241], [150, 212, 150, 241]], "low": 0, "blink": 0,
