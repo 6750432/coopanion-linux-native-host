@@ -126,7 +126,7 @@ class 原生桌宠:
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(True)
         self.模型 = 鲸鱼模型(网页目录)
-        self.网格 = 网格渲染器(self.模型, max(.2, 缩放 * 1.25), 格步)
+        self.网格 = 挑渲染器(self.模型, max(.2, 缩放 * 1.25), 格步)
         self.鱼 = 小鱼(self.模型, self.网格)
         self.屏幕 = 取屏幕()
         self.身体 = 身体(锚点=self.鱼.锚点,
@@ -371,6 +371,33 @@ class 原生桌宠:
     def 报(self):
         if self.帧数:
             记(f"跑了 {self.帧数} 帧，平均每帧 {self.累计ms / self.帧数:.1f} ms（{帧率} fps 上限）")
+
+
+def 挑渲染器(模型, 每单位像素: float, 格步: int):
+    """Pick the mesh renderer. Default stays exactly as before.
+
+    English: `COOP_RENDER=fast` switches to the experimental faster renderer
+    (pixel-equivalent by design; see 网格-快版.py). Anything else — including a
+    failed import — falls back to the stock renderer, so the switch can never
+    break the default path.
+
+    中文：环境变量 `COOP_RENDER=fast` 时启用实验性的快版渲染器（承诺像素等价，
+    见 `网格快版.py`）；其它任何取值、以及 import 失败，都回落到原来的渲染器。
+    **默认路径与原来完全一致。**
+    """
+    _选 = (os.environ.get("COOP_RENDER") or "").strip().lower()
+    if _选 in ("fast", "快", "快版", "exact", "保真"):
+        try:
+            if _选 in ("exact", "保真"):
+                from 网格快版 import 保真快渲染器  # noqa: PLC0415
+                记("渲染器：快版 A′·保真（矩形裁切换成路径裁切，逐位一致）")
+                return 保真快渲染器(模型, 每单位像素, 格步)
+            from 网格快版 import 快渲染器  # noqa: PLC0415
+            记("渲染器：快版 A（矩形裁切；接缝抗锯齿与现状略有差异）")
+            return 快渲染器(模型, 每单位像素, 格步)
+        except Exception as e:                       # noqa: BLE001
+            记(f"⚠ 快版渲染器加载失败，回落到默认：{e!r}")
+    return 网格渲染器(模型, 每单位像素, 格步)
 
 
 def 取屏幕() -> QRect:
