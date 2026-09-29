@@ -1,0 +1,92 @@
+外挂：大脑-本地模型
+================================================================
+作用
+    ⚠️ 开着她会占 5.5G 显存（6G 卡的绝大部分）——不用时在管理器里取消勾选、或跑 引擎停.sh。
+    让她的「脑」跑在本机：协议代理把她的 Responses 协议翻译成 Chat Completions，
+    再用 Jan 自带的 llama-server 跑本机的 Qwen3-8B（全部层上显卡）。
+    已实测跑通：她一轮里 7 次 pet_say，词是本地 8B 现想的，零 API 花费。
+
+状态：**已接真本地模型并跑通**（2026-09-28：她一轮 7 次 pet_say，词是本地 Qwen3-8B 现想的）。
+      Jan 那边不用管 —— 引擎脚本直接用它自带的 llama-server，绕开了 Jan 的 UI 和 API Key。
+
+为什么要做
+    她的 provider（packages/cortico-provider-coo）走 **OpenAI Responses 协议**：
+        POST <baseUrl>/responses，请求体是 Responses 格式，响应是 Responses 的流式事件。
+    而本机 本地推理服务只有 **Chat Completions**：`POST /v1/chat/completions`。
+    协议对不上，所以中间要有个翻译。
+
+文件
+    proxy.py    协议转换代理（只用标准库）。两个方向都转：
+                  请求：instructions → system；input items → messages（含 function_call /
+                        function_call_output 的往返）；tools → chat 的 functions 写法
+                  响应：chat 的 message/tool_calls → Responses 的一整串事件
+                        （created → output_item.added → …arguments.delta/done… → completed）
+                ⚠️ 关键坑：核心按「调用方给没给 onEvent」决定当流还是当 JSON ——
+                   请求体 stream=true 必须回 **SSE**，否则必须回**一个完整的 Response JSON**。
+                   回错了会报 `Unexpected token 'e', "event: res"... is not valid JSON`。
+    mock.py     假模型（零成本测试用）：按「台词.json」原样回一条工具调用或一段文本。
+                防循环：只看「上一轮模型干了什么」，上一轮已经在 pet_say 就不再重复。
+    台词.json   {"工具":"pet_say","参数":{"script":"…"}}
+                ⚠️ 参数名是 **script**（英文）——写成中文「脚本」会静默不生效（踩过）。
+
+怎么用
+    # ① 用假模型自测（不需要任何真模型，她会被戳一下就说台词.json 里那句）
+    bash 装.sh --假模型
+
+    # ② 接真正的本地本地推理服务：先把 Jan 跑起来（本地 API 在 127.0.0.1:1337），然后
+    bash 装.sh                      # 默认上游就是 http://127.0.0.1:1337/v1
+
+    # ③ 接别的 OpenAI 兼容服务也行，第三个参数给模型名
+    bash 装.sh "" http://127.0.0.1:11434/v1 llama3
+
+    # 装/卸都要重启她：bash ~/coop-linux/停.sh && bash ~/coop-linux/开.sh
+    bash 卸.sh                      # 停代理和假模型、把 provider 还原成 DeepSeek
+
+装了什么
+    1. providers/deepseek/config.json：baseUrl → http://127.0.0.1:8899/v1，spec.model → 本地模型名
+       （先备份成 config.json.原版备份）
+    2. providers/deepseek/.env：写一个占位密钥（本地不需要真 key，但核心要求有）
+    3. 两个进程：proxy.py（8899）、mock.py（8111，仅在 --假模型 时），pid 在 运行中/
+
+已验证（2026-09-28）
+    · 代理两种回法分别用 curl 验过：stream=false 回完整 JSON、stream=true 回 SSE；
+    · 端到端：她 → 代理 → 假模型 → 回 pet_say 工具调用 → 世界执行 → **桌面气泡里真的出现
+      「你好呀！」**（DOM 探针读到 display:block + 该文字，截图见
+      ~/Desktop/78/Coopanion-她说出来了-气泡.png）。
+
+实测结论：哪个本地模型能用（2026-09-28，直接读 GGUF 里的 chat_template 判定的，不用起服务）
+    · DeepSeek-R1-Distill-Qwen-7B-Q4_K_M（本地推理服务现在用的那个，4.4G）
+        模板 2081 字符，**不含 `tools` 变量** —— 也就是说工具定义根本不会喂给模型，
+        她拿不到 pet_say / pet_ask 的说明，**不会调用任何工具** → 用它当大脑 = 她一直是哑的。
+        ❌ 不适合
+    · DeepSeek-R1-0528-Qwen3-8B-IQ4_XS（本机另一个，4.3G）
+        模板 5033 字符，**含 `tools`**，而且明确写了调用格式：
+            You are a helpful assistant with tool calling capabilities.
+            When a tool call is needed, you MUST use the following format:
+            <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>FUNCTION_NAME ...
+        （模板取自 sglang 的 tool_chat_template_deepseekr1.jinja）
+        ✅ 适合当她的本地大脑
+
+所以要用本地模型的话：**在 Jan 里换成那个 Qwen3-8B**，然后
+    bash 装.sh "" http://127.0.0.1:1337/v1 deepseek-r1-0528-qwen3-8b     # 模型名按 Jan 里显示的填
+（默认模型名已经改成第一个参数留空时用 Qwen3 那支。）
+
+✅ 端到端跑通（2026-09-28 实测，真模型，零 API 花费）
+    最后一步不用等 Jan 的 UI，也不要用它的钥匙 —— 直接拿 Jan 自带的 llama-server 跑：
+        bash 引擎.sh                      # 用 Qwen3-8B 起一个 llama-server（8123，--jinja，全部层上显卡）
+        bash 装.sh "" http://127.0.0.1:8123/v1 qwen3-local
+        bash ~/coop-linux/停.sh && bash ~/coop-linux/开.sh
+    实测结果：本地引擎服务了 113 次请求、代理收到她 25 次、她一轮里 7 次 pet_say，
+    词是本地 8B 现想的，例如
+        {"script": "【思考】被戳了一下，有点奇怪呢<wink>不过还是想说话。"}
+    显存 5.5G/6G、GPU 41°C、CPU 37°C / PCH 51°C，可接受。
+
+    踩到的两个坑：
+      · 上下文：她的提示词约 7.6k token，所以 -c 至少 8192；显存不够就把 KV cache 量化（q8_0）。
+        一开始用 -c 4096 会把她的话截掉，用 -c 8192 + q8_0 KV 才刚好塞进 6G 卡。
+      · R1 系模型爱长篇推理：第一次测工具调用给 400 token 上限，全被它"想"掉了，
+        看起来像"不会调工具"；给到 2000 就正常回了 __tool_calls__。
+
+    ⚠️ 别指望 Jan 自己的本地服务：新版 Jan（Tauri）的 llama-server 是随机端口 + **要 API Key**
+    （401 Invalid API Key），而且它的模型列表是从自己库里生成的 —— 手改 router.preset.ini 会在
+    Jan 重启时被重写。所以直接用它的二进制自己起最省事。

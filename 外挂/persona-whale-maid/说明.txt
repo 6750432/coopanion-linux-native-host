@@ -1,0 +1,26 @@
+外挂：persona-whale-maid
+================================================================
+作用
+    把角色换成鲸鱼女仆（whale-maid）：一条蓝发的鲸鱼女仆。
+
+装了什么（三处，覆盖前都会先备份）
+    1. app/build/home/companion/workspace/CONSTITUTION.md
+       人格卡（自述）。每次开新 session 会放进系统前缀 —— 写了什么，她就是什么样子。
+       → 备份成 CONSTITUTION.md.原版备份
+    2. app/packages/cortico-world-desktop-pet/src/ENV_PROMPT.md
+       环境提示：讲清身体长什么样（原文写的是「C 形的小身体」，跟鲸鱼形象对不上）、
+       有哪些工具（pet_say / pet_ask / pet_walk_to / pet_act）、会收到哪些事件。
+       → 备份成 ENV_PROMPT.md.原版备份
+    3. app/build/home/companion/config.json 里的 displayName：Coo → 鲸鱼女仆
+       → 备份成 config.json.原版备份
+
+坑
+    · 装完必须重启桌宠才生效（人格卡是 session 开始时读的）。
+    · 人格卡带哈希校验：核心只会覆盖「已知的旧版默认文件」，已被改动过的不会被动
+      （依据 core/seed.ts 里那个 OLD_CONSTITUTION 哈希）。
+    · 名字那一项如果核心自己会写回配置，可能被它覆盖 —— 卸.sh 会处理。
+
+用法
+    bash 装.sh      # 装上
+    bash 卸.sh      # 卸掉，还原成原版 Coo
+    bash 停.sh && bash 开.sh                      # 重启生效

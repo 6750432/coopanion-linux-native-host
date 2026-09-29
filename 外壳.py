@@ -1,0 +1,657 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Coopanion · Linux 外壳（PySide6 + QtWebEngine）
+
+它替代 Coopanion 的 Electron 宿主（host/electron-main.cjs），通过作者设计好的
+扩展点 CORTICO_DESKTOP_PET_HOST 被 World 拉起：
+
+    CORTICO_DESKTOP_PET_HOST='["python3","外壳.py"]'
+    → python3 外壳.py --pet-url=http://127.0.0.1:<端口>/pet --parent-pid=<pid>
+
+Electron 宿主做的事，这里一一对应：
+    · 透明、无边框、置顶、跳过任务栏、覆盖工作区的窗口   → Qt 窗口 flag
+    · 默认点击穿透（setIgnoreMouseEvents true）           → Qt.WindowTransparentForInput
+    · 网页通过 preload 暴露的 window.petHost 控制窗口      → 注入同名垫片 + QWebChannel
+    · 光标位置喂给网页（onCursor）                        → XQueryPointer 轮询
+    · 采样窗口背后的屏幕像素（sampleBackdrop）            → QScreen.grabWindow
+    · 装扮窗口（openDress）                              → 第二个窗口
+
+**不改核心、不改 World 一行代码**：网页只认 `window.petHost` 是否存在，
+注入同名对象即可（网页源码第 14 行：`const host = window.petHost || null`）。
+"""
+from __future__ import annotations
+
+import ctypes
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+from PySide6.QtCore import QPoint, QObject, QRect, Qt, QTimer, QUrl, Slot
+from PySide6.QtGui import QCursor, QGuiApplication, QIcon
+from PySide6.QtWebChannel import QWebChannel
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWidgets import QApplication, QWidget
+
+# ── 参数 ──────────────────────────────────────────────────────────────
+PET_URL = ""
+PARENT_PID = 0
+for i, a in enumerate(sys.argv):
+    if a.startswith("--pet-url="):
+        PET_URL = a.split("=", 1)[1]
+    elif a.startswith("--parent-pid="):
+        try:
+            PARENT_PID = int(a.split("=", 1)[1])
+        except ValueError:
+            pass
+if not PET_URL:
+    print("用法: 外壳.py --pet-url=http://127.0.0.1:<端口>/pet", file=sys.stderr)
+    sys.exit(2)
+
+BASE = PET_URL[: -len("/pet")] if PET_URL.endswith("/pet") else PET_URL
+日志路径 = os.environ.get("COOP_SHELL_LOG") or os.path.expanduser("~/coop-linux/logs/外壳.log")
+日志 = open(日志路径, "a", buffering=1)
+
+
+def 记(*a):
+    print(f"[外壳 {time.strftime('%H:%M:%S')}]", *a, file=日志)
+
+
+# ── 光标位置（Electron 用 IPC 喂给网页；本外壳改用 XQueryPointer）───
+class X光标本:
+    """Minimal ctypes holder for the libX11 / libXext handles.
+    
+    libX11 / libXext 的 ctypes 句柄薄封装。库不在时 `ok=False`，调用方必须自行判断。
+    """
+    def __init__(self) -> None:
+        self.ok = False
+        try:
+            self.x = ctypes.CDLL("libX11.so.6")
+            self.x.XOpenDisplay.restype = ctypes.c_void_p
+            self.x.XDefaultRootWindow.restype = ctypes.c_ulong
+            self.x.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+            self.dpy = self.x.XOpenDisplay(None)
+            self.root = self.x.XDefaultRootWindow(self.dpy)
+            self.ok = bool(self.dpy)
+        except Exception as exc:
+            记("X 打不开，光标功能关闭:", exc)
+
+    def 取(self):
+        if not self.ok:
+            return None
+        px, py = ctypes.c_int(), ctypes.c_int()
+        wx, wy = ctypes.c_int(), ctypes.c_int()
+        m = ctypes.c_uint()
+        xr = ctypes.c_ulong()
+        r = self.x.XQueryPointer(self.dpy, self.root, ctypes.byref(xr), ctypes.byref(xr),
+                                 ctypes.byref(px), ctypes.byref(py),
+                                 ctypes.byref(wx), ctypes.byref(wy), ctypes.byref(m))
+        return (px.value, py.value) if r else None
+
+
+class X矩形(ctypes.Structure):
+    """XShape 要的矩形结构（XRectangle）。"""
+    _fields_ = [("x", ctypes.c_short), ("y", ctypes.c_short),
+                ("width", ctypes.c_ushort), ("height", ctypes.c_ushort)]
+
+
+def _开Xext():
+    """加载 libXext（XShape 在里面）。加载不到就退化成「永远全穿透」，不影响桌宠显示。"""
+    try:
+        库 = ctypes.CDLL("libXext.so.6")
+        库.XShapeCombineRectangles.restype = None
+        库.XShapeCombineRectangles.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+                                               ctypes.c_int, ctypes.c_int, ctypes.POINTER(X矩形),
+                                               ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        return 库
+    except Exception as exc:
+        记("libXext 打不开，输入区功能关闭:", exc)
+        return None
+
+
+XEXT = _开Xext()
+
+
+# ── 给网页的桥（对应 preload.cjs 暴露的那 8 个方法）────────────────────
+class 桥(QObject):
+    """Qt signal bridge between the embedded page and the shell: the page reports an event, Python receives it as a slot call.
+    
+    网页与外壳之间的 Qt 信号桥：页面里发生的事件，在 Python 这边变成一次槽函数调用。
+    """
+    def __init__(self, 窗口: "桌宠窗口") -> None:
+        super().__init__()
+        self.w = 窗口
+
+    @Slot(bool)
+    def setInteractive(self, on: bool) -> None:
+        self.w.设穿透(not on)
+
+    @Slot()
+    def focus(self) -> None:
+        self.w.raise_()
+
+    @Slot()
+    def grabFocus(self) -> None:
+        self.w.activateWindow()
+        self.w.raise_()
+
+    @Slot()
+    def releaseFocus(self) -> None:
+        self.w.clearFocus()
+
+    @Slot()
+    def hide(self) -> None:
+        记("网页要求隐藏窗口")
+        self.w.hide()
+
+    @Slot()
+    def openDress(self) -> None:
+        self.w.开装扮()
+
+    @Slot(str)
+    def 报错(self, 文本: str) -> None:
+        记("[网页报错]", 文本)
+
+    @Slot()
+    def quit(self) -> None:
+        记("网页要求退出")
+        QApplication.quit()
+
+
+# 注入的垫片：网页只认 window.petHost 在不在，照原样造一个
+垫片 = r"""
+(function () {
+  if (window.petHost) return;
+  // 不依赖 QWebChannel：动作塞进队列，Python 侧每 100ms 取一次（零依赖、无异步时机问题）
+  window.__petQueue = window.__petQueue || [];
+  const push = (n, a) => { try { window.__petQueue.push({ n: n, a: a || [] }); } catch (e) {} };
+  window.addEventListener('error', (e) => push('报错', [String(e.message) + ' @' + (e.filename || '').split('/').pop() + ':' + e.lineno]));
+  window.addEventListener('unhandledrejection', (e) => push('报错', ['Promise: ' + String(e.reason)]));
+  window.petHost = {
+    setInteractive: (on) => push('setInteractive', [!!on]),
+    focus: () => push('focus'),
+    grabFocus: () => push('grabFocus'),
+    releaseFocus: () => push('releaseFocus'),
+    hide: () => push('hide'),
+    openDress: () => push('openDress'),
+    onCursor: (cb) => { window.__petCursorCb = cb; },
+    sampleBackdrop: (rect, skip) => new Promise((resolve) => {
+      window.__petBackdropResolve = resolve;
+      push('sampleBackdrop', [rect, skip]);
+    }),
+  };
+  // 她本体的位置一变就推进队列（外壳拿它当 XShape 输入区，省掉外壳侧的轮询 IPC）
+  (function () {
+    let 上次 = '';
+    const 看 = () => {
+      const p = document.getElementById('pet');
+      if (p) {
+        const r = p.getBoundingClientRect();
+        const 现在 = [r.left | 0, r.top | 0, r.width | 0, r.height | 0].join(',');
+        if (现在 !== 上次) { 上次 = 现在; push('petRect', [[r.left, r.top, r.width, r.height]]); }
+      }
+      requestAnimationFrame(看);
+    };
+    requestAnimationFrame(看);
+  })();
+  console.log('petHost 垫片已装好');
+})();
+"""
+
+
+class 诊断页(QWebEnginePage):
+    """Mirrors the page's console output and JavaScript errors into the shell log (invaluable while debugging).
+    
+    把网页的控制台输出和 JS 报错抄到外壳日志里（调试期非常有用）。
+    """
+
+    def javaScriptConsoleMessage(self, level, message, line, source):  # noqa: N802
+        级别 = {0: "log", 1: "warn", 2: "error", 3: "info"}.get(int(level), str(level))
+        记(f"[网页/{级别}] {message}  ({Path(source).name}:{line})")
+
+
+class 桌宠窗口(QWidget):
+    """Transparent, always-on-top window hosting the QtWebEngine page.
+    
+    透明置顶窗口，里面装的是 QtWebEngine 渲染的网页视图。
+    """
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Cortico 桌宠 · Linux 外壳")
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        # 对应 Electron：transparent / frame:false / alwaysOnTop / skipTaskbar
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowDoesNotAcceptFocus       # 不抢键盘焦点
+        )
+        # 输入区（XShape）：默认空 = 完全点透。
+        # ⚠️ 老做法是切窗口的 WindowTransparentForInput + self.show()，两个致命问题：
+        #    ① 页面一说「可交互」，整个 1920×1080 全屏窗口都在吞点击（整屏点不了）；
+        #    ② 每次切换都要重新 show()，鼠标靠近/离开桌宠时窗口闪一下。
+        # 现在窗口 flag 和 show() 一概不碰，只改 XShape 的输入区：空区域=点透，给几块=只有那几块能点。
+        self.输入区: list = []          # 当前实际设上去的全部矩形
+        self.本体区: list = []          # 她本体（永远收点击）——见下面注释
+        self.附加区: list = []          # 悬停按钮 / 菜单 / 气泡上的按钮（页面说可交互时才加）
+        self.可交互 = False
+        self.区计数 = 0
+        self.上次光标 = None
+
+        # 覆盖工作区（对应 Electron 的 wa.x/wa.y/wa.width/wa.height）
+        # ⚠️ 不能在这里取屏幕：QApplication 刚建时 availableGeometry() 会返回 0x0
+        #    （实测踩过：窗口 0×0，什么都看不见）。改成 show 之后用定时器再摆。
+        self._工作区 = QRect(0, 0, 1920, 1080)
+
+        self.view = QWebEngineView(self)
+        self.view.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.view.page().setBackgroundColor(Qt.GlobalColor.transparent)
+        self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+
+        设 = self.view.settings()
+        设.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        设.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
+        设.setAttribute(QWebEngineSettings.WebAttribute.ShowScrollBars, False)
+
+        # ⚠️ 踩过两个坑，都记下来：
+        #   1) 自制 QWebEnginePage + setPage() 会**收不到 loadFinished**（实测页面一直不加载）；
+        #   2) 就算换页成功，换页会把它之前装的 WebChannel / 注入脚本一起带走。
+        #    所以这里**不换页**，直接用 view 自带的 page；
+        #    网页里的报错靠垫片里的 window.onerror 通过 WebChannel 回传（见 垫片）。
+        self.page = self.view.page()
+
+        # QWebChannel + 注入垫片
+        self.通道 = QWebChannel(self.page)
+        self.桥 = 桥(self)
+        self.通道.registerObject("petBridge", self.桥)
+        self.page.setWebChannel(self.通道)
+
+        脚本 = QWebEngineScript_建()
+        self.page.scripts().insert(脚本)
+
+        # 光标轮询（对应 Electron 往网页发 pet:cursor）
+        self.光标 = X光标本()
+        self.定时 = QTimer(self)
+        self.定时.timeout.connect(self._喂光标)
+        self.定时.start(100)
+        self.队列定时 = QTimer(self)
+        self.队列定时.timeout.connect(self._取队列)
+        self.队列定时.start(150)      # 原来 100ms（10 次/秒 IPC），实测其实没必要这么勤
+
+        # 看门狗：可交互状态下光标连续 3 次（约 2 秒）不在输入区里 → 强制回到全穿透。
+        # 有它在，「整屏点不了」这件事物理上不可能发生。
+        self.狗 = QTimer(self)
+        self.狗.timeout.connect(self._查输入区)
+        self.狗.start(700)
+
+        # 她本体的位置：正常由网页在 rAF 里推（见垫片），这里只在收不到时兜底，所以放到 5 秒一次
+        self.本体定时 = QTimer(self)
+        self.本体定时.timeout.connect(self._刷本体)
+        self.本体定时.start(5000)
+
+        def 加载完了(ok: bool) -> None:
+            记("页面加载", "成功" if ok else "失败", PET_URL)
+            QTimer.singleShot(2500, self._自检)
+
+        self.view.loadStarted.connect(lambda: 记("开始加载", PET_URL))
+        self.view.loadProgress.connect(lambda p: 记(f"加载进度 {p}%") if p in (50, 100) else None)
+        self.view.loadFinished.connect(加载完了)
+        self.view.load(QUrl(PET_URL))
+
+        # 装扮窗口
+        self.装扮: QWebEngineView | None = None
+
+        # 探针通道：开发时把一段 JS 写进 ~/coop-linux/探针.js，
+        # 外壳跑一次、把返回值写进日志、再把文件删掉（一次性，不用重启）。
+        self.探针路径 = Path.home() / "coop-linux" / "探针.js"
+        self.探针定时 = QTimer(self)
+        self.探针定时.timeout.connect(self._跑探针)
+        self.探针定时.start(1200)
+
+        # 父进程死了就退出（World 用 --parent-pid 通知本进程）
+        if PARENT_PID:
+            self.父检查 = QTimer(self)
+            self.父检查.timeout.connect(self._查父进程)
+            self.父检查.start(3000)
+
+    # ── 摆位 ───────────────────────────────────────────────
+    def _自检(self) -> None:
+        """问网页几个关键问题，写进日志（桌宠没出来时靠这个定位）。"""
+        脚本 = """
+        (function () {
+          const pet = document.getElementById('pet');
+          let 节点数 = 0, 宽 = 0;
+          if (pet) { 节点数 = pet.querySelectorAll('*').length; 宽 = pet.getBoundingClientRect().width; }
+          return JSON.stringify({
+            ready: document.readyState, inner: [innerWidth, innerHeight],
+            hasHost: !!window.petHost, bridge: !!window.__petBridge,
+            petEl: !!pet, 子节点: 节点数, pet宽: 宽,
+            bodyBg: getComputedStyle(document.body).backgroundColor,
+            scripts: [...document.scripts].map(s => s.src.split('/').pop()).filter(Boolean),
+            title: document.title,
+          });
+        })()
+        """
+        try:
+            self.view.page().runJavaScript(脚本, lambda r: 记("自检:", r))
+        except Exception as exc:
+            记("自检失败:", exc)
+
+    def _跑探针(self) -> None:
+        """看一眼 探针.js 在不在；在就跑一次、结果记日志、然后把文件删掉。"""
+        try:
+            if not self.探针路径.exists():
+                return
+            代码 = self.探针路径.read_text(encoding="utf-8")
+            self.探针路径.unlink()
+            记("探针 →", 代码.strip().replace("\n", " ")[:70])
+            self.view.page().runJavaScript(代码, lambda r: 记(f"探针 ← {r}"))
+        except Exception as exc:
+            记("探针失败:", exc)
+
+    def showEvent(self, e) -> None:      # noqa: N802
+        super().showEvent(e)
+        QTimer.singleShot(80, self._摆好)
+
+    def _摆好(self) -> None:
+        """把窗口摆成覆盖工作区（此时屏幕信息一定拿到了）。"""
+        try:
+            屏 = QGuiApplication.primaryScreen()
+            几何 = 屏.availableGeometry() if 屏 else QRect(0, 0, 1920, 1080)
+            全屏 = 屏.geometry() if 屏 else 几何
+        except Exception:
+            几何, 全屏 = QRect(0, 0, 1920, 1080), QRect(0, 0, 1920, 1080)
+        if 几何.width() <= 0 or 几何.height() <= 0:
+            记(f"⚠️ 屏幕几何异常（{几何.width()}x{几何.height()}），回退到全屏 {全屏.width()}x{全屏.height()}")
+            几何 = 全屏
+        if 几何.width() <= 0 or 几何.height() <= 0:
+            记("⚠️ 还是拿不到尺寸，用 1920×1080 兜底")
+            几何 = QRect(0, 0, 1920, 1080)
+        self._工作区 = 几何
+        self.setGeometry(几何)
+        self.view.setGeometry(0, 0, 几何.width(), 几何.height())
+        记(f"窗口摆好：{几何.x()},{几何.y()} {几何.width()}×{几何.height()}")
+
+    # ── 行为 ───────────────────────────────────────────────
+    # ── 输入区（XShape）：决定「哪些像素能点到她」───────────────
+    # 设计（踩过坑才改成这样）：
+    #   · 基础区 = 她本体那一小块，**永远收点击**。为什么不能只在页面说「可交互」时才收：
+    #     她完全点透时窗口收不到 mouseover，页面只能靠外壳喂的光标位置判定，
+    #     一来一回有几十~几百毫秒 —— 鼠标刚移上去就点，第一下会直接穿过去（实测踩到）。
+    #   · 附加区 = 页面说「可交互」时给的悬停按钮 / 右键菜单 / 气泡上的关闭×和选项按钮。
+    #   · 其余区域一律穿透；单块矩形超过 900 像素直接丢掉（防呆）。
+    区域上限 = 900
+
+    本体脚本 = r"""
+     (function () {
+       const p = document.getElementById('pet');
+       if (!p) return '[]';
+       const r = p.getBoundingClientRect();
+       return JSON.stringify(r.width > 1 && r.height > 1 ? [[r.left, r.top, r.width, r.height]] : []);
+     })()
+    """
+
+    附加脚本 = r"""
+     (function () {
+       const out = [];
+       const 加 = (el) => {
+         if (!el) return;
+         const st = getComputedStyle(el);
+         if (st.display === 'none' || st.visibility === 'hidden' || +st.opacity < 0.02) return;
+         if (st.pointerEvents === 'none') return;
+         const r = el.getBoundingClientRect();
+         if (r.width > 1 && r.height > 1) out.push([r.left, r.top, r.width, r.height]);
+       };
+       const bubble = document.getElementById('bubble');       // 气泡整块不收，
+       if (bubble) bubble.querySelectorAll('.b-close, .b-opt, .b-own').forEach(加);   // 只有按钮收
+       const menu = document.getElementById('menu');
+       if (menu && !menu.hidden) 加(menu);                     // 右键菜单（开着才算）
+       const tools = document.getElementById('tools');
+       if (tools) [...tools.children].forEach(加);             // 悬停按钮要按钮本身
+       return JSON.stringify(out);
+     })()
+    """
+
+    def 设输入区(self, 区s) -> None:
+        """把窗口可接收输入的区域设成这组屏幕矩形；传空列表 = 完全点透。"""
+        if XEXT is None or not self.光标.ok:
+            return
+        try:
+            原点 = self.mapToGlobal(QPoint(0, 0))
+            净 = []
+            for x, y, w, h in 区s:
+                w, h = min(int(w), self.区域上限), min(int(h), self.区域上限)
+                x0 = max(0, int(x) - 原点.x())
+                y0 = max(0, int(y) - 原点.y())
+                x1 = min(self.width(), x0 + w)
+                y1 = min(self.height(), y0 + h)
+                if x1 - x0 > 1 and y1 - y0 > 1:
+                    净.append((x0, y0, x1 - x0, y1 - y0))
+            数组 = (X矩形 * max(1, len(净)))()
+            for i, (x, y, w, h) in enumerate(净):
+                数组[i] = X矩形(x, y, w, h)
+            XEXT.XShapeCombineRectangles(self.光标.dpy, int(self.winId()), 2, 0, 0,
+                                         数组, len(净), 0, 0)      # 2=ShapeInput 0=ShapeSet
+            self.光标.x.XFlush(self.光标.dpy)
+            if 净 != self.输入区:
+                记(f"输入区 → {len(净)} 块" + (f"：{净}" if 净 else "（全穿透）"))
+            self.输入区 = 净
+        except Exception as exc:
+            记("设输入区失败:", exc)
+
+    def _算输入区(self) -> None:
+        """基础区 ∪（可交互时的）附加区。"""
+        self.设输入区(list(self.本体区) + (list(self.附加区) if self.可交互 else []))
+
+    def _刷本体(self) -> None:
+        try:
+            self.view.page().runJavaScript(self.本体脚本, self._收本体)
+        except Exception:
+            pass
+
+    def _收本体(self, 结果) -> None:
+        try:
+            区s = json.loads(结果) if 结果 else []
+        except Exception:
+            区s = []
+        if 区s != self.本体区:
+            self.本体区 = 区s
+            self._算输入区()
+
+    def 设交互(self, on: bool) -> None:
+        """页面说「现在可交互」→ 问它要附加矩形；说「不用了」→ 只留她本体。"""
+        self.可交互 = bool(on)
+        self.区计数 = 0
+        if not on:
+            self.附加区 = []
+            self._算输入区()
+            return
+        try:
+            self.view.page().runJavaScript(self.附加脚本, lambda r: self._收附加(r))
+        except Exception as exc:
+            记("问附加矩形失败:", exc)
+
+    def _收附加(self, 结果) -> None:
+        if not self.可交互:
+            return
+        try:
+            区s = json.loads(结果) if 结果 else []
+        except Exception:
+            区s = []
+        self.附加区 = 区s
+        self._算输入区()
+
+    def _查输入区(self) -> None:
+        """看门狗：可交互状态但光标连续几次不在附加区里 → 收掉附加区（她本体不受影响）。"""
+        if not self.可交互 or not self.附加区:
+            return
+        原点 = self.mapToGlobal(QPoint(0, 0))
+        p = self.光标.取()
+        在里 = bool(p) and any(原点.x() + a <= p[0] < 原点.x() + a + w
+                               and 原点.y() + b <= p[1] < 原点.y() + b + h
+                               for a, b, w, h in self.附加区)
+        if 在里:
+            self.区计数 = 0
+            self.设交互(True)          # 重问一次（菜单/气泡可能是后冒出来的）
+        else:
+            self.区计数 += 1
+            if self.区计数 >= 3:
+                self.可交互 = False
+                self.附加区 = []
+                self._算输入区()
+                记("看门狗：光标离开附加区 → 收掉附加区")
+
+    def 开装扮(self) -> None:
+        记("打开装扮窗口")
+        if self.装扮 is None:
+            self.装扮 = QWebEngineView()
+            self.装扮.setWindowTitle("桌宠装扮")
+            self.装扮.resize(1000, 760)
+            self.装扮.load(QUrl(BASE + "/web/dress.html"))
+        self.装扮.show()
+        self.装扮.raise_()
+
+    def _取队列(self) -> None:
+        """每 100ms 把网页塞进 __petQueue 的动作取出来执行（代替 Electron 的 IPC）。"""
+        self.view.page().runJavaScript(
+            "JSON.stringify((window.__petQueue||[]).splice(0))",
+            self._处理队列)
+
+    def _处理队列(self, 载荷) -> None:
+        if not 载荷:
+            return
+        try:
+            动作 = json.loads(载荷)
+        except Exception:
+            return
+        for 项 in 动作:
+            名 = 项.get("n")
+            参 = 项.get("a") or []
+            try:
+                if 名 == "petRect":
+                    区s = 参[0] if 参 else []
+                    try:
+                        self.本体区 = [[float(a), float(b), float(c), float(d)] for a, b, c, d in 区s]
+                        self._算输入区()
+                    except Exception:
+                        pass
+                elif 名 == "setInteractive":
+                    self.设交互(bool(参[0]))
+                elif 名 == "focus":
+                    self.raise_()
+                elif 名 == "grabFocus":
+                    self.activateWindow(); self.raise_()
+                elif 名 == "releaseFocus":
+                    self.clearFocus()
+                elif 名 == "hide":
+                    记("网页要求隐藏"); self.hide()
+                elif 名 == "openDress":
+                    self.开装扮()
+                elif 名 == "sampleBackdrop":
+                    self._采样背景(参[0] if 参 else {}, 参[1] if len(参) > 1 else [])
+                elif 名 == "报错":
+                    记("[网页报错]", 参[0] if 参 else "")
+            except Exception as exc:
+                记("处理动作出错", 名, exc)
+
+    def _喂光标(self) -> None:
+        """把光标位置喂给网页。⚠️ 只在位置变了才发 —— 原来每 100 毫秒无条件发一次
+        IPC，空转时就白烧掉 6~7% CPU（实测）。"""
+        p = self.光标.取()
+        if not p:
+            return
+        x, y = p[0] - self.x(), p[1] - self.y()
+        在窗口内 = 0 <= x < self.width() and 0 <= y < self.height()
+        val = f"{{x:{x},y:{y}}}" if 在窗口内 else "null"
+        if val == self.上次光标:
+            return
+        self.上次光标 = val
+        self.view.page().runJavaScript(
+            f"window.__petCursorCb && window.__petCursorCb({val});")
+
+    def _采样背景(self, rect, skip) -> None:
+        """对应 pet:sampleBackdrop：把窗口背后那块屏幕像素抓回去给网页。"""
+        try:
+            x = int(rect.get("x", 0)) + self.x()
+            y = int(rect.get("y", 0)) + self.y()
+            w = max(1, int(rect.get("w", 0)))
+            h = max(1, int(rect.get("h", 0)))
+            图 = QGuiApplication.primaryScreen().grabWindow(0, x, y, w, h).toImage()
+            out = []
+            for yy in range(h):
+                for xx in range(w):
+                    c = 图.pixelColor(xx, yy)
+                    out.extend([c.red(), c.green(), c.blue()])
+            self.view.page().runJavaScript(
+                f"window.__petBackdropResolve && window.__petBackdropResolve({json.dumps(out)});")
+        except Exception as exc:
+            记("采样背景失败:", exc)
+            self.view.page().runJavaScript(
+                "window.__petBackdropResolve && window.__petBackdropResolve(null);")
+
+    def _查父进程(self) -> None:
+        try:
+            os.kill(PARENT_PID, 0)
+        except OSError:
+            记("父进程（核心）没了，外壳退出")
+            QApplication.quit()
+
+    def closeEvent(self, e) -> None:      # noqa: N802
+        记("窗口关闭")
+        super().closeEvent(e)
+
+
+def QWebEngineScript_建():
+    """在文档创建时注入垫片（等价于 Electron 的 preload）。"""
+    from PySide6.QtWebEngineCore import QWebEngineScript
+
+    s = QWebEngineScript()
+    s.setName("petHost-shim")
+    s.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+    s.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+    s.setRunsOnSubFrames(False)
+    # 先建 QWebChannel 的前端，再挂垫片
+    # 直接注入垫片：它的动作走队列，不依赖 QWebChannel
+    # （试过先加载 qrc:///qtwebchannel/qwebchannel.js 再建通道，实测在
+    #  DocumentCreation 时机不可靠 —— 网页里 hasHost 始终是 false。改成队列后稳了。）
+    # 帧率上限（COOP_FPS=24 之类）：桌宠 24 帧已经够顺，全屏软件合成时能省一半 CPU。
+    # 骨骼弹簧是按 dt 积分的，降帧只影响顺滑度，不影响动作正确性。
+    限帧 = os.environ.get("COOP_FPS", "").strip()
+    追加 = ""
+    if 限帧.isdigit() and int(限帧) > 0:
+        追加 = f"""
+// 帧率上限：节流到 {限帧} fps。
+// ⚠️ 别用「时间不够就再调一次 requestAnimationFrame」那种写法 —— 实测在这套 QtWebEngine 里
+//    它会静默卡死：回调永不触发、页面变雕像，而 CPU 看上去还很低（曾误判一轮）。
+//    这里改成：先 setTimeout 等到点，再交给真正的 rAF 出手，回调保证跑到。
+(function () {{
+  const 最小间隔 = 1000 / {限帧};
+  const 原 = window.requestAnimationFrame.bind(window);
+  const 原取消 = window.cancelAnimationFrame.bind(window);
+  let 上次 = 0;
+  window.requestAnimationFrame = (回调) => {{
+    const 等 = Math.max(0, 最小间隔 - (performance.now() - 上次));
+    return setTimeout(() => {{ 上次 = performance.now(); 原(回调); }}, 等);
+  }};
+  window.cancelAnimationFrame = (id) => {{ clearTimeout(id); 原取消(id); }};
+}})();
+"""
+    s.setSourceCode(垫片 + 追加 + "\n//# sourceURL=petHost-shim.js")
+    return s
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    app.setApplicationName("Cortico 桌宠（Linux 外壳）")
+    w = 桌宠窗口()
+    w.show()
+    QTimer.singleShot(400, lambda: w.设输入区([]))     # 开局全穿透，页面说可交互才放开
+    记(f"外壳启动 pid={os.getpid()} 工作区={w._工作区.width()}x{w._工作区.height()} 页面={PET_URL}")
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
