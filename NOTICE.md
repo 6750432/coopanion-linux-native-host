@@ -17,7 +17,7 @@
 
 - 版权：`Copyright (c) 2026 BZYS17Mintstar (6750432)`
 - 生成说明：`Generated with the assistance of AI (DeepSeek V4), guided by human architectural intuition.`
-- 许可：MIT —— 全文见 [`LICENSE-BZYS17Mintstar`](LICENSE-BZYS17Mintstar)（与上游条款文本相同）
+- 许可：MIT —— 全文见 [`LICENSE-LOCAL`](LICENSE-LOCAL)（与上游条款文本相同）
 - 范围：`原生/`、`外壳.py`、`打包.py`、`工具/`、`外挂/` 下的脚本与文档，
   以及仓库内其余不属于上游的文件。约 4,300 行 Python 加配套脚本。
 
