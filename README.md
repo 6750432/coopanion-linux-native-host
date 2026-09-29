@@ -163,7 +163,7 @@ python3 原生/量路线.py 原生                          # 端到端量内存
 - [`LICENSE`](LICENSE) 是上游 MIT 许可全文的**逐字节拷贝，版权声明一字未改**
   （`Copyright (c) 2026 Phantivia`）。
 - 本项目自行编写的宿主代码同样以 MIT 提供，版权为
-  **`Copyright (c) 2026 BZYS17Mintstar.`** —— 完整的版权与来源划分见 [`NOTICE.md`](NOTICE.md)。
+  **`Copyright (c) 2026 BZYS17Mintstar (6750432)`** —— 完整的版权与来源划分见 [`NOTICE.md`](NOTICE.md)。
 
 **特别感谢上游**：把「宠物窗口」设计成可替换的一层（页面侧 `window.petHost` 探测 +
 内核侧 `CORTICO_DESKTOP_PET_HOST`），本项目才可能在不改动内核一个字节的前提下换掉渲染层；
