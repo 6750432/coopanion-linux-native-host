@@ -50,6 +50,49 @@ instead of Electron/Chromium. The upstream Node core is reused as-is.
 
 ---
 
+## 平台支持：X11 与 Wayland / Platform Support
+
+**当前状态：X11 已实机运行；Wayland 已完成协议层实现与沙盒实测，但本机暂无本地 Wayland 会话，尚未接入宿主启动路径。**
+
+本项目原先只针对 X11。Wayland 方向的代码在 [`wayland/`](wayland/)，完整记录见 [`docs/Wayland-Adaptation-Research.md`](docs/Wayland-Adaptation-Research.md)。
+
+**关键判断：本项目的渲染器本来就产出 CPU 光栅化完成的 ARGB 位图，而 Wayland 的共享内存机制本质上就是「共享一块像素缓冲」，因此渲染层无需任何改动** —— 需要替换的只有窗口层与输入层。
+
+### 运行时能力探测：三级降级 / Capability Probing and Three-Tier Degradation
+
+| 层级 | 探测条件 | 使用的能力 | 覆盖范围 |
+|---|---|---|---|
+| **第 1 层** | 存在 `zwlr_layer_shell_v1` | 原生层壳：自主定位、常驻置顶、输入区裁剪 | wlroots 系合成器、KDE |
+| **第 2 层** | 无层壳协议，但 X11 连接可用 | **现有 X11 后端，无需改动** | GNOME 等提供兼容层的会话 |
+| **第 3 层** | 两者皆不可用 | 原生全屏窗口 + 子表面 | 兜底 |
+
+探测的是**能力**，而不是「当前会话是不是 Wayland」这一个布尔值。在缺少层壳协议的环境下，X11 / XWayland 路径的能力反而**优于**原生 Wayland 路径 —— 因为它能提供原生路径无法提供的窗口定位与常驻置顶。
+
+### 沙盒实测：四种提交策略 / Sandbox Measurements
+
+| 模式 | 帧率 | 客户端 CPU | 合成器 CPU | 绘制 ms |
+|---|---|---|---|---|
+| 小窗 360×360 | 39.5 / 39.4 | 2.5 / 2.5 | 1.6 / 1.9 | 0.35 / 0.34 |
+| 全屏，整屏提交 | 35.7 / 35.7 | 5.1 / 5.1 | **10.9 / 11.0** | 1.13 / 1.10 |
+| 全屏，局部提交 | 39.4 / 39.4 | 4.0 / 3.7 | **1.7 / 1.6** | 0.68 / 0.66 |
+| **子表面** | 39.4 / 39.4 | **1.2 / 1.2** | 1.9 / 1.7 | **0.06 / 0.05** |
+
+（每格为「第一轮 / 第二轮」，同一会话内背靠背量取。）
+
+合成器只为被报告为「已损坏」的区域付出代价：整屏提交与局部提交相差约 **6.5 倍**；子表面方案再把客户端绘制耗时降低约 **11 倍**。端到端另有像素验证（非黑 95132、包围盒 348×348）与点击穿透验证（区域外点击 **0** 次泄漏）。
+
+### 生态现状 / Ecosystem Status
+
+层壳协议不是通用协议。GNOME 维护者 **ebassi** 就此的说明，是本项目降级策略的直接依据：
+
+> "No, there aren't any replacements. Not all windowing systems provide the ability for applications to control the window stacking order; Wayland is one of those. The stacking order is under the control of the window manager, as a privileged component … You can use platform-specific API, if you want to access that functionality."
+
+> 「没有替代品。不是所有窗口系统都让应用控制堆叠顺序，Wayland 就是其中之一。堆叠顺序归窗口管理器这个特权组件管……你想用的话可以用平台专属 API。」
+
+**特别感谢 GNOME 维护者 ebassi 的提醒** —— 它澄清了「堆叠顺序归窗口管理器这一特权组件管」是 Wayland 协议治理的**既定设计取向**，而不是实现缺失。而这句话里提到的「平台专属 API」（即层壳协议）在 GNOME 上并不存在。**这正是本项目在无 `zwlr_layer_shell_v1` 的环境下选择降级为 X11 / XWayland 后端的根本原因**：不是对某个桌面环境的抱怨，而是在尊重上游协议治理与窗口管理器主权的前提下，选择能力满足需求的后端。
+
+---
+
 ## 实测对比（同一台机器、同一个内核、背靠背量的）
 
 ### 宠物窗口那一层的内存
@@ -139,6 +182,8 @@ python3 原生/量路线.py 原生                          # 端到端量内存
 外挂/          可插拔的「外挂」：角色人设 / 配色 / 本地模型大脑
   管理器.py        勾选式开关界面，往目录里丢一个包就自动出现
 工具/          启动器与诊断脚本
+wayland/       Wayland 协议层适配与测试床（不参与宿主启动）→ 见 wayland/README.md
+docs/          研究文档 → docs/Wayland-Adaptation-Research.md
 其他用法见 原生/README-quickstart.txt
 ```
 
@@ -147,6 +192,10 @@ python3 原生/量路线.py 原生                          # 端到端量内存
 ## 已知限制（诚实交代）
 
 - **macOS / Windows 没跑过**，本项目只针对 Linux/X11。
+- **Wayland 尚未接入宿主启动路径**：协议层实现与沙盒实测已完成（见
+  [`docs/Wayland-Adaptation-Research.md`](docs/Wayland-Adaptation-Research.md)），
+  但宿主目前仍走 X11，且**从未在真实的本地 Wayland 会话上运行过**（本机没有该环境）。
+  层壳协议（第 1 层）也从未实际运行（本机没有 wlroots 系合成器）。
 - 音效、麦克风、右键菜单、装扮窗、键盘回话、`prefs.scale` 热更新**都还没做**。
 - 渲染是 **CPU 光栅**（QPainter），不是 GPU；本机实测格步 3（81 格）约 5.7 ms/帧、
   格步 1（547 格）约 18.6 ms/帧 —— 想要更高帧率就调大 `COOP_GRID`。
